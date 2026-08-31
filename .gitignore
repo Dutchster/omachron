@@ -1,0 +1,20 @@
+# Python bytecode from scripts/ and tests/
+__pycache__/
+*.py[cod]
+
+# Node — only ever needed to run the test suite
+node_modules/
+npm-debug.log*
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Local runtime state, never part of the plugin
+*.log
+*.tmp
+*.corrupt-*
+history.json

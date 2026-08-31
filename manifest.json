@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "dutchster.omachron",
+  "name": "Omachron",
+  "version": "1.0.0",
+  "author": "Dutchster",
+  "license": "MIT",
+  "description": "Know where your time goes. Live per-app and per-site screen time in your bar, with a work-versus-slacking split, week, month and year trends, and usage insights — terminal-aware, keyboard-first, fully local.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omachron",
+    "description": "Daily per-app and per-site usage with insights",
+    "category": "Wellbeing",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

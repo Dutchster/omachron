@@ -1,0 +1,66 @@
+name: CI
+
+# The three commands CONTRIBUTING asks you to run by hand, run automatically
+# so an outside PR cannot quietly break the suite.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  javascript:
+    name: JavaScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Model.js and State.js are loaded by QML's JS engine, which has no
+      # module system and reports syntax errors only at runtime.
+      - name: Syntax-check the shared modules
+        run: |
+          node --check lib/Model.js
+          node --check lib/State.js
+          node --check lib/Messages.js
+
+      - name: Unit tests
+        run: node --test tests/model.test.js tests/state.test.js tests/messages.test.js
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Byte-compile the resolver
+        run: python3 -m py_compile scripts/resolve_app.py
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+
+  qmllint:
+    name: qmllint (advisory)
+    runs-on: ubuntu-latest
+    # Advisory only: qmllint's warnings depend on the Qt version it ships
+    # with, so a stricter runner should not fail a PR that is fine on the
+    # Qt the shell actually runs. BarWidget.qml is excluded here for the
+    # reason the README gives -- it trips stock qmllint.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt Quick tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-declarative-dev-tools
+      - name: Lint
+        run: |
+          qmllint6 Panel.qml Service.qml 2>&1 \
+            || qmllint Panel.qml Service.qml
