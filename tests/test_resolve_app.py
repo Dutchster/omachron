@@ -296,6 +296,26 @@ class Lz4Tests(unittest.TestCase):
             write_mozlz4(path, b'{"ok": true}')
             self.assertEqual(r.read_mozlz4(path), b'{"ok": true}')
 
+    def test_mozlz4_oversized_file_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "recovery.jsonlz4")
+            write_mozlz4(path, b'{"ok": true}')
+            # Sparse-extend past the compressed cap; content is irrelevant,
+            # the size check must fire before anything is read.
+            os.truncate(path, r._MOZLZ4_MAX_BYTES + 1)
+            with self.assertRaises(ValueError):
+                r.read_mozlz4(path)
+
+    def test_mozlz4_oversized_declared_size_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "recovery.jsonlz4")
+            with open(path, "wb") as f:
+                f.write(b"mozLz40\0"
+                        + struct.pack("<I", r._MOZLZ4_MAX_OUT + 1)
+                        + lz4_literal_encode(b'{"ok": true}'))
+            with self.assertRaises(ValueError):
+                r.read_mozlz4(path)
+
 
 class FirefoxSessionTests(unittest.TestCase):
     SESSION = {
@@ -352,6 +372,17 @@ class FirefoxSessionTests(unittest.TestCase):
 
     def test_missing_profile_yields_no_tabs(self):
         with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(r.firefox_open_tabs(tmp), [])
+
+    def test_oversized_store_degrades_to_no_tabs(self):
+        # Same degradation as every other failure: no tabs, so the service
+        # falls back to the plain browser bucket instead of parsing a
+        # session store past the size ceiling on every poll tick.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_firefox_session(tmp, self.SESSION)
+            os.truncate(
+                os.path.join(tmp, "sessionstore-backups", "recovery.jsonlz4"),
+                r._MOZLZ4_MAX_BYTES + 1)
             self.assertEqual(r.firefox_open_tabs(tmp), [])
 
 

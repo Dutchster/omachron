@@ -549,6 +549,22 @@ Item {
     }
   }
 
+  // The fetcher bounds its own network calls (curl --max-time, timeout on
+  // getent), but the queue only advances onExited — so a run that somehow
+  // never exits would stall icon fetching for the whole session. Same
+  // pattern as resolveWatchdog: kill it after a hard deadline generous
+  // enough that only a wedged run can hit it; the domain stays in
+  // iconAttempted, so it retries next shell session rather than looping.
+  Timer {
+    id: iconFetchWatchdog
+    interval: 120000
+    repeat: false
+    running: iconFetchProc.running
+    onTriggered: {
+      if (iconFetchProc.running) iconFetchProc.running = false
+    }
+  }
+
   // Safety net: catches appId-only changes and any missed activeToplevel
   // events. Cheap enough to run every 2s; real switches are event-driven.
   Timer {

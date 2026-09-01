@@ -386,12 +386,27 @@ def lz4_block_decompress(src, max_out):
     return bytes(dst)
 
 
+# Ceilings for a Firefox-family session store, mirroring _SNSS_MAX_BYTES on
+# the Chromium side: a store past the compressed cap is not worth replaying
+# on a poll tick, and a header that declares a decompressed size far beyond
+# what that could expand to is a corrupt or hostile file, not a session.
+# Without the caps this path would read, decompress (the header size field
+# is an arbitrary u32) and json-parse an unbounded file every 5 seconds
+# while a browser holds focus.
+_MOZLZ4_MAX_BYTES = 20 * 1024 * 1024
+_MOZLZ4_MAX_OUT = 8 * _MOZLZ4_MAX_BYTES
+
+
 def read_mozlz4(path):
+    if os.path.getsize(path) > _MOZLZ4_MAX_BYTES:
+        raise ValueError("mozLz4 file exceeds size ceiling")
     with open(path, "rb") as fh:
         data = fh.read()
     if not data.startswith(b"mozLz40\0"):
         raise ValueError("not a mozLz4 file")
     (out_size,) = struct.unpack_from("<I", data, 8)
+    if out_size > _MOZLZ4_MAX_OUT:
+        raise ValueError("mozLz4 declared size exceeds ceiling")
     return lz4_block_decompress(data[12:], out_size)
 
 

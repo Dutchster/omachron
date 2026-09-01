@@ -12,7 +12,9 @@
 # against SSRF and resource exhaustion: HTTPS only, redirects followed
 # manually with each hop's hostname resolved and required to be public,
 # DNS pinned with --resolve so the checked addresses are the ones curl
-# connects to, and a hard byte ceiling on every download.
+# connects to, a hard byte ceiling on every download, and the result
+# accepted only as a known bitmap type whose declared dimensions fit a
+# decode ceiling.
 #
 # Usage: fetch_site_icon.sh <domain> <dest.png>
 # Exits non-zero when no usable image could be fetched.
@@ -29,6 +31,7 @@ dest="${2:-}"
 [[ $domain == *[A-Za-z]* ]] || exit 1
 
 max_bytes=2097152 # 2 MiB ceiling per download
+max_dim=2048      # decoded-dimension ceiling per side
 site_url="https://$domain/"
 tmp="$dest.tmp.$$"
 page_tmp="$dest.page.$$"
@@ -59,10 +62,12 @@ ipv6_private() {
 
 # Resolve a hostname and print its addresses comma-joined, failing unless
 # every address is public. All-or-nothing so a name that mixes public and
-# private answers (a rebinding staple) is rejected outright.
+# private answers (a rebinding staple) is rejected outright. getent has no
+# deadline of its own — only the resolver's retry schedule — so it gets a
+# hard one here; curl's is --max-time.
 public_addrs() {
   local addrs ip
-  addrs=$(getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u)
+  addrs=$(timeout 5 getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u)
   [[ -n $addrs ]] || return 1
   while IFS= read -r ip; do
     if [[ $ip == *:* ]]; then
@@ -97,9 +102,32 @@ safe_download() {
   [[ $(stat -c%s "$out" 2>/dev/null || echo 0) -le $max_bytes ]]
 }
 
+# The byte ceiling alone does not bound decoding: a 2 MiB PNG can declare
+# gigapixel dimensions, and image/* also admits SVG, which is a document
+# format rather than a bitmap. Accept only common bitmap types, and require
+# every dimension pair `file` reports (PNG "180 x 180", JPEG "1024x768",
+# each frame of a multi-icon ICO) to fit the ceiling. No reported
+# dimensions reads as "cannot verify" and fails closed.
+image_ok() {
+  local mime dims pair w h
+  mime=$(file -b --mime-type "$1")
+  case $mime in
+  image/png | image/jpeg | image/gif | image/webp | image/x-icon | image/vnd.microsoft.icon) ;;
+  *) return 1 ;;
+  esac
+  dims=$(file -b "$1" | grep -oE '[0-9]+ ?x ?[0-9]+')
+  [[ -n $dims ]] || return 1
+  while IFS= read -r pair; do
+    w=${pair%%x*}
+    h=${pair##*x}
+    w=${w// /}
+    h=${h// /}
+    ((w >= 1 && h >= 1 && w <= max_dim && h <= max_dim)) || return 1
+  done <<<"$dims"
+}
+
 download_icon() {
-  safe_download "$1" "$tmp" &&
-    [[ -s $tmp && $(file -b --mime-type "$tmp") == image/* ]]
+  safe_download "$1" "$tmp" && [[ -s $tmp ]] && image_ok "$tmp"
 }
 
 fetch_site_icon() {
