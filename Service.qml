@@ -533,9 +533,15 @@ Item {
 
   // Fetches one site icon at a time; the queue survives failures because a
   // miss only marks iconAttempted (retry next shell session, not in a loop).
+  //
+  // Wrapped in GNU timeout, which runs the command in its own process
+  // group and signals the GROUP — both when its own deadline expires and
+  // when the watchdog below TERMs it — so bash's curl/getent descendants
+  // are reaped with it instead of being orphaned mid-transfer.
   Process {
     id: iconFetchProc
-    command: ["bash", root.iconFetcherPath, root.iconFetching,
+    command: ["timeout", "--kill-after=5", "120",
+      "bash", root.iconFetcherPath, root.iconFetching,
       root.iconsDir + "/" + root.iconFetching + ".png"]
     onExited: function(exitCode) {
       if (exitCode === 0 && root.iconFetching) {
@@ -550,14 +556,14 @@ Item {
   }
 
   // The fetcher bounds its own network calls (curl --max-time, timeout on
-  // getent), but the queue only advances onExited — so a run that somehow
-  // never exits would stall icon fetching for the whole session. Same
-  // pattern as resolveWatchdog: kill it after a hard deadline generous
-  // enough that only a wedged run can hit it; the domain stays in
+  // getent) and the timeout wrapper bounds the whole tree at 120s — but
+  // the queue only advances onExited, so this backstop kills a run the
+  // wrapper somehow failed to end. TERMing the wrapper forwards to its
+  // process group, taking the descendants with it; the domain stays in
   // iconAttempted, so it retries next shell session rather than looping.
   Timer {
     id: iconFetchWatchdog
-    interval: 120000
+    interval: 130000
     repeat: false
     running: iconFetchProc.running
     onTriggered: {
@@ -639,9 +645,15 @@ Item {
   // that cannot start would leave resolves stalling until the watchdog.
   // sh always exists, exits 0 without output instead, and the empty
   // result falls back to tracking the raw terminal class.
+  //
+  // The timeout wrapper gives the whole resolver tree (sh execs into
+  // python3, which spawns hyprctl) a hard in-tree deadline just past the
+  // 10s watchdog, and — because GNU timeout signals its child's process
+  // group — makes both that deadline and the watchdog's TERM reap the
+  // descendants, not just the direct child.
   Process {
     id: resolverProc
-    command: ["sh", "-c",
+    command: ["timeout", "--kill-after=2", "12", "sh", "-c",
       "command -v python3 >/dev/null 2>&1 && exec python3 \"$1\" || exit 0",
       "sh", root.resolverPath]
     stdout: StdioCollector {

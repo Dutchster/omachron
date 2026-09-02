@@ -14,7 +14,10 @@
 # DNS pinned with --resolve so the checked addresses are the ones curl
 # connects to, a hard byte ceiling on every download, and the result
 # accepted only as a known bitmap type whose declared dimensions fit a
-# decode ceiling.
+# decode ceiling. Scratch files live in a fresh private directory (0700,
+# unpredictable name) on the destination's own filesystem, so nothing can
+# pre-position a symlink where curl writes and the final publish is one
+# atomic rename.
 #
 # Usage: fetch_site_icon.sh <domain> <dest.png>
 # Exits non-zero when no usable image could be fetched.
@@ -33,9 +36,24 @@ dest="${2:-}"
 max_bytes=2097152 # 2 MiB ceiling per download
 max_dim=2048      # decoded-dimension ceiling per side
 site_url="https://$domain/"
-tmp="$dest.tmp.$$"
-page_tmp="$dest.page.$$"
-trap 'rm -f "$tmp" "$page_tmp"' EXIT
+destdir=$(dirname -- "$dest")
+
+# Predictable "$dest.tmp.$$" paths in a shared directory would let another
+# same-user process pre-position a symlink for curl to follow. Instead all
+# scratch space lives in a directory mktemp just created 0700 with an
+# unpredictable name — inside destdir, so publishing stays a same-filesystem
+# atomic rename — and umask keeps everything written there 0600. The EXIT
+# trap removes it on every path a signal lets us see; only SIGKILL can
+# leave one behind, so stale ones are swept after an hour rather than
+# accumulating.
+mkdir -p -- "$destdir" || exit 1
+find "$destdir" -maxdepth 1 -type d -name '.fetch.*' -mmin +60 \
+  -exec rm -rf {} + 2>/dev/null
+umask 077
+tmpdir=$(mktemp -d -- "$destdir/.fetch.XXXXXXXX") || exit 1
+tmp="$tmpdir/icon"
+page_tmp="$tmpdir/page"
+trap 'rm -rf -- "$tmpdir"' EXIT
 
 ipv4_private() {
   local a b c d
@@ -151,11 +169,11 @@ fetch_site_icon() {
     download_icon "https://www.google.com/s2/favicons?domain=${domain}&sz=256"
 }
 
-mkdir -p "$(dirname "$dest")"
 if fetch_site_icon; then
-  mv -f "$tmp" "$dest"
-  rm -f "$page_tmp"
-  trap - EXIT
+  # -T so a directory planted at $dest fails the rename instead of the
+  # icon being moved inside it; rename replaces a symlinked $dest itself
+  # rather than following it. The EXIT trap sweeps the now-empty tmpdir.
+  mv -fT -- "$tmp" "$dest" || exit 1
   exit 0
 fi
 exit 1
