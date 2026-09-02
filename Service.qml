@@ -451,7 +451,10 @@ Item {
 
   Process {
     id: borderSizeProc
-    command: ["hyprctl", "-j", "getoption", "general:border_size"]
+    // head bounds the collector at the producer: hyprctl's reply is a few
+    // dozen bytes, so anything past the cap is garbage by definition.
+    command: ["sh", "-c",
+      "hyprctl -j getoption general:border_size 2>/dev/null | head -c 4096; exit 0"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -465,11 +468,28 @@ Item {
     }
   }
 
+  // Prepares the data directory and seeds an empty history — and, because
+  // it runs before every FileView reload, it is also the boundary that
+  // keeps a pre-positioned path out of the adapter: anything at
+  // history.json that is not a regular file owned by us (a symlink, a
+  // fifo, a foreign-uid file) is moved aside, a file past the byte
+  // ceiling is evicted before FileView would buffer it, the seed is
+  // written under noclobber (O_CREAT|O_EXCL, which refuses to follow even
+  // a dangling symlink), and the mode is pinned to 0600.
   Process {
     id: ensureDirProc
     environment: ({ "HOME": root.home })
-    command: ["bash", "-c",
-      "mkdir -p \"$HOME/.config/omarchy/omachron/icons\"; f=\"$HOME/.config/omarchy/omachron/history.json\"; [[ -f \"$f\" ]] || printf '{}\\n' > \"$f\""]
+    command: ["bash", "-c", [
+      'd="$HOME/.config/omarchy/omachron"',
+      'mkdir -p "$d/icons"',
+      'f="$d/history.json"',
+      'now=$(date +%s)',
+      'if [[ -L "$f" || ( -e "$f" && ! -f "$f" ) || ( -e "$f" && ! -O "$f" ) ]]; then mv -f -- "$f" "$f.invalid-$now" 2>/dev/null || rm -f -- "$f"; fi',
+      'if [[ -f "$f" && $(stat -c%s -- "$f" 2>/dev/null || echo 0) -gt 10485760 ]]; then mv -f -- "$f" "$f.oversized-$now"; fi',
+      '[[ -e "$f" ]] || (set -C; printf "{}\\n" > "$f") 2>/dev/null',
+      '[[ -f "$f" && ! -L "$f" ]] && chmod 600 -- "$f"',
+      'exit 0'
+    ].join("; ")]
     onExited: {
       historyFile.reload()
       iconScanProc.running = true
@@ -507,12 +527,14 @@ Item {
   }
 
   // One-shot startup inventory of already-fetched icons, so restarts reuse
-  // the cache instead of refetching every site.
+  // the cache instead of refetching every site. head bounds the collector
+  // at the producer; a listing past the cap only means a few icons
+  // re-fetch, which the per-domain queue absorbs.
   Process {
     id: iconScanProc
     environment: ({ "HOME": root.home })
     command: ["bash", "-c",
-      "ls \"$HOME/.config/omarchy/omachron/icons\" 2>/dev/null || true"]
+      "ls \"$HOME/.config/omarchy/omachron/icons\" 2>/dev/null | head -c 65536; exit 0"]
     stdout: StdioCollector {
       id: iconScanOut
       waitForEnd: true
@@ -586,14 +608,20 @@ Item {
   }
 
   // Preserve a corrupt history file before the next persist overwrites it.
-  // Only a non-empty file that fails to parse is moved aside, so transient
-  // load errors never destroy a valid history.
+  // Only a non-empty regular non-symlink file that fails to parse is moved
+  // aside, so transient load errors never destroy a valid history — and
+  // the parse itself is size-capped so this never buffers an oversized
+  // file just to decide it is broken.
   property bool backupAttempted: false
   Process {
     id: backupProc
     environment: ({ "HOME": root.home })
-    command: ["bash", "-c",
-      "f=\"$HOME/.config/omarchy/omachron/history.json\"; if [[ -s \"$f\" ]] && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \"$f\" 2>/dev/null; then mv -f \"$f\" \"$f.corrupt-$(date +%s)\"; fi"]
+    command: ["bash", "-c", [
+      'f="$HOME/.config/omarchy/omachron/history.json"',
+      '[[ -f "$f" && ! -L "$f" && -s "$f" ]] || exit 0',
+      'size=$(stat -c%s -- "$f" 2>/dev/null || echo 0)',
+      'if (( size > 10485760 )) || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" 2>/dev/null; then mv -f -- "$f" "$f.corrupt-$(date +%s)"; fi'
+    ].join("; ")]
   }
 
   // A terminal's foreground process changes without the compositor noticing

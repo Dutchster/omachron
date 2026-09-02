@@ -45,10 +45,17 @@ destdir=$(dirname -- "$dest")
 # atomic rename — and umask keeps everything written there 0600. The EXIT
 # trap removes it on every path a signal lets us see; only SIGKILL can
 # leave one behind, so stale ones are swept after an hour rather than
-# accumulating.
+# accumulating. The sweep touches only directories carrying this script's
+# own creation signature (our uid, mktemp's exact 0700, aged past any
+# in-tree deadline) and is deliberately not recursive: a run only ever
+# creates "icon" and "page", so exactly those names are unlinked and the
+# directory removed only if that emptied it — contents someone else put
+# there are never deleted, the dir is just left standing.
 mkdir -p -- "$destdir" || exit 1
-find "$destdir" -maxdepth 1 -type d -name '.fetch.*' -mmin +60 \
-  -exec rm -rf {} + 2>/dev/null
+find "$destdir" -maxdepth 1 -type d -name '.fetch.*' \
+  -uid "$(id -u)" -perm 700 -mmin +60 -exec sh -c \
+  'for d do rm -f -- "$d/icon" "$d/page"; rmdir -- "$d" 2>/dev/null; done' \
+  sh {} + 2>/dev/null
 umask 077
 tmpdir=$(mktemp -d -- "$destdir/.fetch.XXXXXXXX") || exit 1
 tmp="$tmpdir/icon"

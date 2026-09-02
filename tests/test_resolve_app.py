@@ -7,6 +7,8 @@ Process-touching tests use the current process (always alive, always in
 /proc), so nothing here needs a running Hyprland session.
 """
 
+import contextlib
+import io
 import json
 import os
 import struct
@@ -315,6 +317,22 @@ class Lz4Tests(unittest.TestCase):
                         + lz4_literal_encode(b'{"ok": true}'))
             with self.assertRaises(ValueError):
                 r.read_mozlz4(path)
+
+
+class OutputCapTests(unittest.TestCase):
+    def test_emit_truncates_to_ceiling(self):
+        # Everything printed traces to an untrusted name; the service
+        # buffers the stream in full, so the producer bounds each line.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r.emit("x" * (r._MAX_OUTPUT_CHARS * 4))
+        self.assertEqual(buf.getvalue(), "x" * r._MAX_OUTPUT_CHARS + "\n")
+
+    def test_emit_passes_short_lines_through(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r.emit("site:github.com")
+        self.assertEqual(buf.getvalue(), "site:github.com\n")
 
 
 class FirefoxSessionTests(unittest.TestCase):

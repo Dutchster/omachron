@@ -76,6 +76,16 @@ except (OSError, json.JSONDecodeError):
 # (SITE_KEY_RE) with the site's registrable label and favicon.
 SITE_KEY_PREFIX = "site:"
 
+# Ceiling on any single line this script prints. Every name here traces to
+# an untrusted source (argv[0] basenames from /proc, ACF titles, URL
+# hosts) and the service buffers stdout and stderr in full, so the
+# producer bounds them: a real tracking name fits in a fraction of this.
+_MAX_OUTPUT_CHARS = 256
+
+
+def emit(line, stream=None):
+    print(str(line)[:_MAX_OUTPUT_CHARS], file=stream or sys.stdout)
+
 # Web apps that deserve their own identity: hosts kept as their own
 # tracking bucket instead of folding into the registrable domain, so
 # mail.google.com is gmail rather than more google. Single source of
@@ -756,7 +766,7 @@ def main():
     if _steam_class_appid(window_class) is not None:
         title = steam_title_for_class(window_class)
         if title:
-            print(title)
+            emit(title)
         sys.exit(0)
 
     # Browsers: resolve the focused tab to a site key from the session
@@ -768,10 +778,10 @@ def main():
         try:
             site = resolve_browser_site(canonical, window_title)
         except Exception as err:  # noqa: BLE001 — degrade, never crash
-            print(f"site resolution failed: {err!r}", file=sys.stderr)
+            emit(f"site resolution failed: {err!r}", stream=sys.stderr)
             site = None
         if site:
-            print(site)
+            emit(site)
         sys.exit(0)
 
     if not terminal_pid:
@@ -779,7 +789,7 @@ def main():
 
     name = _resolve_terminal_foreground(terminal_pid)
     if name:
-        print(name)
+        emit(name)
 
 
 if __name__ == "__main__":
