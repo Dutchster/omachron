@@ -11,14 +11,23 @@ import "lib/State.js" as State
 // focused time per app into a per-day record persisted as JSON. No focused
 // window means the clock is paused; idle/lock/desktop time is not counted.
 //
-// Persistence is a single append-only JSON file
+// Persistence is a single JSON file
 //   ~/.config/omarchy/omachron/history.json
 // shaped as
-//   { "<YYYY-MM-DD>": { "total": <ms>, "apps": { "<appId>": <ms> } } }
+//   { "days":   { "<YYYY-MM-DD>": { "total": <ms>, "apps": { "<key>": <ms> } } },
+//     "months": { "<YYYY-MM>": <ms> | { "total": <ms>, "slack": <ms> } },
+//     "slack":  { "<key>": <bool> } }
 //
-// Writes are event-driven (on focus change) and debounced through the
-// adapter; a 60s commit bounds how much of an in-flight bucket can be lost
-// to a crash. Data survives plugin hot-reloads because it lives on disk.
+// All disk access goes through scripts/fs_guard.py, which performs the
+// whole transaction — trusted-chain traversal, O_NOFOLLOW leaf open, size
+// and type checks on the held descriptor, quarantine/seed recovery, and
+// atomic descriptor-relative publication — before this file ever parses a
+// byte, and whose exit code gates whether the result is trusted at all.
+// Loaded JSON is then schema-checked by Model.sanitizeHistory before any
+// value reaches a long-lived model. Writes are event-driven (on focus
+// change), debounced, and serialized through the same helper; a 60s
+// commit bounds how much of an in-flight bucket can be lost to a crash.
+// Data survives plugin hot-reloads because it lives on disk.
 //
 // State transitions live in State.js (pure, testable). This file owns the
 // side effects: timers, disk I/O, process spawning, and QML property
@@ -34,9 +43,14 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string dataDir: home + "/.config/omarchy/omachron"
-  readonly property string historyPath: dataDir + "/history.json"
   readonly property string resolverPath: {
     var u = Qt.resolvedUrl("scripts/resolve_app.py").toString()
+    return u.startsWith("file://") ? u.slice(7) : u
+  }
+  // Descriptor-based filesystem helper; every history/icon disk
+  // transaction runs through it (see the header comment).
+  readonly property string guardPath: {
+    var u = Qt.resolvedUrl("scripts/fs_guard.py").toString()
     return u.startsWith("file://") ? u.slice(7) : u
   }
   readonly property string iconsDir: dataDir + "/icons"
@@ -170,7 +184,7 @@ Item {
   function toggleSlack(app) {
     if (!app) return
     root.slack = Model.toggleSlack(root.slack, app)
-    historyAdapter.slack = root.slack
+    root.scheduleSave()
   }
   function fmt(ms) { return Model.fmt(ms) }
   function relativeDayLabel(key) { return Model.relativeDayLabel(key, root.todayKey) }
@@ -332,9 +346,8 @@ Item {
 
   // ---- Persistence -------------------------------------------------------
 
-  // Reassigns a fresh top-level object so the JsonAdapter's notifier fires,
-  // which schedules the debounced disk write. The live in-memory day is
-  // folded into the mirror first — root.today is the source of truth while
+  // Folds the live in-memory day into the mirror and schedules the
+  // debounced disk write — root.today is the source of truth while
   // root.days mirrors what is on disk.
   function persist() {
     if (root.startupPhase) return
@@ -349,10 +362,9 @@ Item {
         if (Object.prototype.hasOwnProperty.call(merged, k) && !Object.prototype.hasOwnProperty.call(kept, k)) pruned[k] = merged[k]
       }
       root.months = Model.rollupPrunedDays(root.months, pruned, root.slack)
-      historyAdapter.months = root.months
     }
     root.days = kept
-    historyAdapter.days = kept
+    root.scheduleSave()
   }
 
   function scheduleSave() {
@@ -360,16 +372,86 @@ Item {
     saveTimer.restart()
   }
 
-  function onHistoryLoaded() {
-    // sanitizeHistory rejects arrays and other non-objects that would slip
-    // through a bare typeof check; identity comparison tells us whether
-    // anything was discarded so the user gets one clear warning.
-    var clean = Model.sanitizeHistory(historyAdapter.days, historyAdapter.months)
-    if (clean.days !== historyAdapter.days || clean.months !== historyAdapter.months)
+  // One invocation shape for every fs_guard call, so the deadline, the
+  // kill-after grace, the python3 probe (Quickshell's Process exposes no
+  // spawn-failure signal; the distinct 127 fails closed rather than
+  // open), and the process-group semantics cannot drift apart between
+  // load, save and listing.
+  function guardCommand(sub) {
+    return ["timeout", "--kill-after=2", "10", "sh", "-c",
+      "command -v python3 >/dev/null 2>&1 && exec python3 \"$1\" " + sub + " || exit 127",
+      "sh", root.guardPath]
+  }
+
+  // Serializes the full current state through fs_guard save-history. One
+  // save runs at a time; a request arriving mid-save queues exactly one
+  // follow-up, which snapshots the state current at launch, so the last
+  // writer always carries everything. A payload identical to the last
+  // successful save is skipped outright — the heartbeat persists on a
+  // fixed cadence whether or not anything changed, and an idle session
+  // should not rewrite the same bytes every few seconds.
+  function startSave() {
+    if (root.persistBlocked) return
+    if (saveProc.running) {
+      root.saveQueued = true
+      return
+    }
+    var payload = JSON.stringify({
+      days: root.days,
+      months: root.months,
+      slack: root.slack
+    })
+    if (payload === root.lastSavedPayload) return
+    root.pendingPayload = payload
+    saveProc.running = true
+  }
+
+  // fs_guard load-history exit codes 0 (existing history served), 4 (fresh
+  // seed) and 5 (bad file quarantined, fresh seed served) all mean stdout
+  // carries JSON the helper read off a verified descriptor. Anything else
+  // — trust failure, IO failure, missing python3, the timeout wrapper —
+  // means the trusted chain could not be established, and the session
+  // fails closed: tracking runs in memory only and never writes through a
+  // chain that failed verification (persistBlocked). Losing one session
+  // of persistence to a transient error is the accepted cost.
+  function onHistoryLoaded(code, text, errText) {
+    if (errText.trim())
+      console.warn("dutchster.omachron: fs_guard load-history:", errText.trim())
+    var parsed = null
+    if (code === 0 || code === 4 || code === 5) {
+      try {
+        parsed = JSON.parse(text)
+      } catch (e) {
+        // Contract violation: the helper only prints validated JSON.
+        console.warn("dutchster.omachron: helper returned unparseable history")
+      }
+    }
+    if (parsed === null || typeof parsed !== "object") {
+      console.warn("dutchster.omachron: history unavailable (fs_guard exit "
+        + code + "); tracking in memory only for this session")
+      root.persistBlocked = true
+      root.days = {}
+      root.ready = true
+      root.startupPhase = false
+      root.lastTick = Date.now()
+      root.switchActive()
+      root.iconScanDone = true // icon cache sits behind the same failed chain
+      return
+    }
+    // The helper guarantees well-formed JSON of bounded size; the schema —
+    // date-shaped keys, exact record shapes, key-length/cardinality caps,
+    // finite numeric ranges — is enforced here, before anything reaches a
+    // long-lived model. Identity comparison tells us whether anything was
+    // discarded so the user gets one clear warning — but only for
+    // sections the file actually carried: a fresh seed is just "{}" and
+    // its absent sections are not malformed.
+    var clean = Model.sanitizeHistory(parsed.days, parsed.months)
+    if ((parsed.days !== undefined && clean.days !== parsed.days)
+        || (parsed.months !== undefined && clean.months !== parsed.months))
       console.warn("dutchster.omachron: history.json has malformed sections; ignoring them")
     var d = clean.days
     var m = clean.months
-    root.slack = Model.sanitizeSlack(historyAdapter.slack)
+    root.slack = Model.sanitizeSlack(parsed.slack)
     var kept = Model.pruneDays(d, Model.dayKey(new Date()), root.keepDays)
     if (kept !== d) {
       // Same rollup as persist(): load-time retention drops also feed the
@@ -378,62 +460,78 @@ Item {
       for (var k in d) {
         if (Object.prototype.hasOwnProperty.call(d, k) && !Object.prototype.hasOwnProperty.call(kept, k)) pruned[k] = d[k]
       }
-      m = Model.rollupPrunedDays(m, pruned)
-      historyAdapter.months = m
+      m = Model.rollupPrunedDays(m, pruned, root.slack)
     }
     root.months = m
     root.days = kept
-    if (!root.ready) {
-      root.todayKey = Model.dayKey(new Date())
-      var prev = d[root.todayKey]
-      root.today = prev && typeof prev === "object"
-        ? { total: prev.total || 0, apps: Object.assign({}, prev.apps || {}) }
-        : Model.newDay()
-      root.ready = true
-      root.startupPhase = false
-      root.lastTick = Date.now()
-      root.switchActive()
-      root.sweepTodayIcons()
-    } else {
-      // Retry after a seed: keep the live bucket, just refresh the mirror.
-      var nd = Object.assign({}, root.days)
-      nd[root.todayKey] = root.today
-      root.days = nd
+    root.todayKey = Model.dayKey(new Date())
+    var prev = d[root.todayKey]
+    root.today = prev && typeof prev === "object"
+      ? { total: prev.total || 0, apps: Object.assign({}, prev.apps || {}) }
+      : Model.newDay()
+    root.ready = true
+    root.startupPhase = false
+    root.lastTick = Date.now()
+    root.switchActive()
+    iconListProc.running = true
+  }
+
+  // Set when the load transaction failed: the session tracks in memory
+  // only and never writes to disk (fail closed, see onHistoryLoaded).
+  property bool persistBlocked: false
+  property bool saveQueued: false
+  property bool saveFailedWarned: false
+  // Snapshot handed to the running saveProc, and the payload of the last
+  // save that succeeded (used to skip byte-identical rewrites).
+  property string pendingPayload: ""
+  property string lastSavedPayload: ""
+
+  // Loads history through the fs_guard transaction (see guardCommand for
+  // the wrapper semantics).
+  Process {
+    id: loadProc
+    environment: ({ "HOME": root.home })
+    command: root.guardCommand("load-history")
+    stdout: StdioCollector {
+      id: loadOut
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: loadErr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.onHistoryLoaded(exitCode, loadOut.text, loadErr.text)
     }
   }
 
-  function onHistoryLoadFailed() {
-    // Expected on the very first run (file seeded by ensureDirProc) and on
-    // a malformed file. Preserve a corrupt file before the next persist
-    // overwrites it, then start empty rather than refusing to track.
-    console.warn("dutchster.omachron: history load failed, starting empty")
-    if (!root.backupAttempted) {
-      root.backupAttempted = true
-      backupProc.running = true
+  // Writes history through fs_guard save-history: the full state is
+  // streamed over stdin and published by the helper as an atomic
+  // descriptor-relative rename, so no pathname is composed on this side.
+  // Closing stdinEnabled after the write flushes and signals EOF.
+  Process {
+    id: saveProc
+    environment: ({ "HOME": root.home })
+    stdinEnabled: true
+    command: root.guardCommand("save-history")
+    onStarted: {
+      saveProc.write(root.pendingPayload)
+      saveProc.stdinEnabled = false
     }
-    if (!root.ready) {
-      root.days = {}
-      root.ready = true
-      root.startupPhase = false
-      root.lastTick = Date.now()
-      root.switchActive()
-    }
-  }
-
-  FileView {
-    id: historyFile
-    path: root.historyPath
-    printErrors: true
-    atomicWrites: true
-    onAdapterUpdated: root.scheduleSave()
-    onLoaded: root.onHistoryLoaded()
-    onLoadFailed: root.onHistoryLoadFailed()
-
-    JsonAdapter {
-      id: historyAdapter
-      property var days: ({})
-      property var months: ({})
-      property var slack: ({})
+    onExited: function(exitCode) {
+      saveProc.stdinEnabled = true // re-arm for the next run
+      if (exitCode === 0) {
+        root.lastSavedPayload = root.pendingPayload
+        root.saveFailedWarned = false
+      } else if (!root.saveFailedWarned) {
+        root.saveFailedWarned = true
+        console.warn("dutchster.omachron: history save failed (fs_guard exit "
+          + exitCode + "); will keep retrying on future saves")
+      }
+      if (root.saveQueued) {
+        root.saveQueued = false
+        root.startSave() // re-snapshots, and skips if nothing changed
+      }
     }
   }
 
@@ -468,34 +566,6 @@ Item {
     }
   }
 
-  // Prepares the data directory and seeds an empty history — and, because
-  // it runs before every FileView reload, it is also the boundary that
-  // keeps a pre-positioned path out of the adapter: anything at
-  // history.json that is not a regular file owned by us (a symlink, a
-  // fifo, a foreign-uid file) is moved aside, a file past the byte
-  // ceiling is evicted before FileView would buffer it, the seed is
-  // written under noclobber (O_CREAT|O_EXCL, which refuses to follow even
-  // a dangling symlink), and the mode is pinned to 0600.
-  Process {
-    id: ensureDirProc
-    environment: ({ "HOME": root.home })
-    command: ["bash", "-c", [
-      'd="$HOME/.config/omarchy/omachron"',
-      'mkdir -p "$d/icons"',
-      'f="$d/history.json"',
-      'now=$(date +%s)',
-      'if [[ -L "$f" || ( -e "$f" && ! -f "$f" ) || ( -e "$f" && ! -O "$f" ) ]]; then mv -f -- "$f" "$f.invalid-$now" 2>/dev/null || rm -f -- "$f"; fi',
-      'if [[ -f "$f" && $(stat -c%s -- "$f" 2>/dev/null || echo 0) -gt 10485760 ]]; then mv -f -- "$f" "$f.oversized-$now"; fi',
-      '[[ -e "$f" ]] || (set -C; printf "{}\\n" > "$f") 2>/dev/null',
-      '[[ -f "$f" && ! -L "$f" ]] && chmod 600 -- "$f"',
-      'exit 0'
-    ].join("; ")]
-    onExited: {
-      historyFile.reload()
-      iconScanProc.running = true
-    }
-  }
-
   // ---- Site favicons -----------------------------------------------------
 
   function requestSiteIcon(domain) {
@@ -527,24 +597,38 @@ Item {
   }
 
   // One-shot startup inventory of already-fetched icons, so restarts reuse
-  // the cache instead of refetching every site. head bounds the collector
-  // at the producer; a listing past the cap only means a few icons
-  // re-fetch, which the per-domain queue absorbs.
+  // the cache instead of refetching every site. fs_guard list-icons
+  // enforces the boundary at the producer — descriptor-relative listing,
+  // regular files only, hostname-shaped names, per-name length limit and
+  // a hard item cap — so no overflow or partial record can exist in its
+  // output; the loop below re-validates every line anyway (defense in
+  // depth) with the same schema and an independent iteration cap, since
+  // these keys later select fetch targets.
   Process {
-    id: iconScanProc
+    id: iconListProc
     environment: ({ "HOME": root.home })
-    command: ["bash", "-c",
-      "ls \"$HOME/.config/omarchy/omachron/icons\" 2>/dev/null | head -c 65536; exit 0"]
+    command: root.guardCommand("list-icons")
     stdout: StdioCollector {
-      id: iconScanOut
+      id: iconListOut
       waitForEnd: true
     }
-    onExited: {
+    onExited: function(exitCode) {
       var icons = {}
-      var lines = iconScanOut.text.split("\n")
-      for (var i = 0; i < lines.length; i++) {
-        var f = lines[i].trim()
-        if (f.slice(-4) === ".png") icons[f.slice(0, -4)] = true
+      if (exitCode === 0) {
+        // The regex, caps and has-a-letter rule mirror fs_guard's
+        // (DOMAIN_RE / MAX_ICONS / MAX_NAME); a drift test in
+        // tests/test_fs_guard.py pins this copy to the helper's.
+        var lines = iconListOut.text.split("\n")
+        var max = Math.min(lines.length, 512)
+        var re = /^[A-Za-z0-9]([A-Za-z0-9-]{0,62})?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62})?)+\.png$/
+        for (var i = 0; i < max; i++) {
+          var f = lines[i].trim()
+          if (f.length <= 258 && re.test(f) && /[A-Za-z]/.test(f.slice(0, -4)))
+            icons[f.slice(0, -4)] = true
+        }
+      } else {
+        console.warn("dutchster.omachron: icon listing failed (fs_guard exit "
+          + exitCode + "); starting with an empty icon cache")
       }
       root.siteIcons = icons
       root.iconVersion++
@@ -562,9 +646,11 @@ Item {
   // are reaped with it instead of being orphaned mid-transfer.
   Process {
     id: iconFetchProc
+    // Only the domain crosses the argv boundary; the destination path is
+    // wholly owned by fs_guard icon-publish inside the fetcher, so this
+    // side never composes a pathname for the script to honor.
     command: ["timeout", "--kill-after=5", "120",
-      "bash", root.iconFetcherPath, root.iconFetching,
-      root.iconsDir + "/" + root.iconFetching + ".png"]
+      "bash", root.iconFetcherPath, root.iconFetching]
     onExited: function(exitCode) {
       if (exitCode === 0 && root.iconFetching) {
         var icons = Object.assign({}, root.siteIcons)
@@ -605,23 +691,6 @@ Item {
       var app = tl && tl.appId ? tl.appId : ""
       if (app !== root.rawApp) root.switchActive()
     }
-  }
-
-  // Preserve a corrupt history file before the next persist overwrites it.
-  // Only a non-empty regular non-symlink file that fails to parse is moved
-  // aside, so transient load errors never destroy a valid history — and
-  // the parse itself is size-capped so this never buffers an oversized
-  // file just to decide it is broken.
-  property bool backupAttempted: false
-  Process {
-    id: backupProc
-    environment: ({ "HOME": root.home })
-    command: ["bash", "-c", [
-      'f="$HOME/.config/omarchy/omachron/history.json"',
-      '[[ -f "$f" && ! -L "$f" && -s "$f" ]] || exit 0',
-      'size=$(stat -c%s -- "$f" 2>/dev/null || echo 0)',
-      'if (( size > 10485760 )) || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" 2>/dev/null; then mv -f -- "$f" "$f.corrupt-$(date +%s)"; fi'
-    ].join("; ")]
   }
 
   // A terminal's foreground process changes without the compositor noticing
@@ -750,7 +819,7 @@ Item {
     id: saveTimer
     interval: 1500
     repeat: false
-    onTriggered: historyFile.writeAdapter()
+    onTriggered: root.startSave()
   }
 
   Connections {
@@ -761,7 +830,7 @@ Item {
   }
 
   Component.onCompleted: {
-    ensureDirProc.running = true
+    loadProc.running = true
     borderSizeProc.running = true
   }
 }

@@ -1523,3 +1523,122 @@ test("startsGroup tolerates junk indices", () => {
   assert.equal(Model.startsGroup([{ group: "a" }], 5), false)
 })
 
+test("sanitizeHistory rejects non-date day keys", () => {
+  const days = {
+    "2026-08-21": { total: 5, apps: { zen: 5 } },
+    "zzz": { total: 5, apps: {} },
+    "2026-13-01": { total: 5, apps: {} },
+    "2026-00-10": { total: 5, apps: {} },
+    "2026-08-32": { total: 5, apps: {} },
+    "26-08-21": { total: 5, apps: {} }
+  }
+  const clean = Model.sanitizeHistory(days, {})
+  assert.deepEqual(Object.keys(clean.days), ["2026-08-21"])
+})
+
+test("sanitizeHistory drops malformed day records", () => {
+  const good = { total: 5, apps: { zen: 5 } }
+  const days = {
+    "2026-08-01": good,
+    "2026-08-02": null,
+    "2026-08-03": [1],
+    "2026-08-04": { total: "5", apps: {} },
+    "2026-08-05": { total: NaN, apps: {} },
+    "2026-08-06": { total: Infinity, apps: {} },
+    "2026-08-07": { total: -1, apps: {} },
+    "2026-08-08": { total: 1e14, apps: {} },
+    "2026-08-09": { total: 5 },
+    "2026-08-10": { total: 5, apps: [1] }
+  }
+  const clean = Model.sanitizeHistory(days, {})
+  assert.deepEqual(Object.keys(clean.days), ["2026-08-01"])
+  assert.equal(clean.days["2026-08-01"], good)
+})
+
+test("sanitizeHistory strips unknown day keys and bad app entries", () => {
+  const days = {
+    "2026-08-01": { total: 5, apps: { zen: 5, bad: "x" }, extra: 1 }
+  }
+  const clean = Model.sanitizeHistory(days, {})
+  assert.deepEqual(clean.days["2026-08-01"], { total: 5, apps: { zen: 5 } })
+})
+
+test("sanitizeHistory truncates an over-cap app map to its largest entries", () => {
+  // A genuine heavy-browsing day can mint one key per visited site, so an
+  // over-cap day keeps its total and its dominant entries instead of
+  // being destroyed.
+  const apps = {}
+  for (let i = 0; i < Model.HISTORY_LIMITS.maxAppsPerDay + 10; i++) apps["app" + i] = i + 1
+  const clean = Model.sanitizeHistory({ "2026-08-01": { total: 5, apps } }, {})
+  const kept = clean.days["2026-08-01"].apps
+  assert.equal(Object.keys(kept).length, Model.HISTORY_LIMITS.maxAppsPerDay)
+  assert.equal(clean.days["2026-08-01"].total, 5)
+  // The largest values survive, the smallest are dropped.
+  assert.equal(kept["app" + (Model.HISTORY_LIMITS.maxAppsPerDay + 9)],
+    Model.HISTORY_LIMITS.maxAppsPerDay + 10)
+  assert.equal(kept["app0"], undefined)
+})
+
+test("sanitizeHistory drops app keys past the length limit", () => {
+  const long = "a".repeat(Model.HISTORY_LIMITS.maxKeyLen + 1)
+  const apps = { zen: 5 }
+  apps[long] = 5
+  const clean = Model.sanitizeHistory({ "2026-08-01": { total: 5, apps } }, {})
+  assert.deepEqual(clean.days["2026-08-01"].apps, { zen: 5 })
+})
+
+test("sanitizeHistory fails a whole section closed past the entry cap", () => {
+  const days = {}
+  for (let i = 0; i <= Model.HISTORY_LIMITS.maxDays; i++) {
+    const d = new Date(2000, 0, 1)
+    d.setDate(d.getDate() + i)
+    days[Model.dayKey(d)] = { total: 1, apps: {} }
+  }
+  assert.deepEqual(Model.sanitizeHistory(days, {}).days, {})
+
+  const months = {}
+  for (let i = 0; i <= Model.HISTORY_LIMITS.maxMonths; i++) {
+    months[2000 + Math.floor(i / 12) + "-" + String((i % 12) + 1).padStart(2, "0")] = 1
+  }
+  assert.deepEqual(Model.sanitizeHistory({}, months).months, {})
+})
+
+test("sanitizeHistory validates month keys and both month record shapes", () => {
+  const months = {
+    "2026-07": 9823400,
+    "2026-08": { total: 100, slack: 20 },
+    "2026-06": { total: 100 },
+    "2026-05": { total: 100, slack: 20, extra: 1 },
+    "2026-13": 5,
+    "2026-04": { total: NaN, slack: 0 },
+    "2026-03": { total: 1, slack: -1 },
+    "2026-02": "junk"
+  }
+  const clean = Model.sanitizeHistory({}, months)
+  assert.deepEqual(clean.months, {
+    "2026-07": 9823400,
+    "2026-08": { total: 100, slack: 20 },
+    "2026-06": { total: 100, slack: 0 },
+    "2026-05": { total: 100, slack: 20 }
+  })
+})
+
+test("sanitizeHistory preserves identity on fully valid input", () => {
+  const days = { "2026-08-21": { total: 5, apps: { zen: 5 } } }
+  const months = { "2026-07": 9823400, "2026-08": { total: 1, slack: 0 } }
+  const clean = Model.sanitizeHistory(days, months)
+  assert.equal(clean.days, days)
+  assert.equal(clean.months, months)
+})
+
+test("sanitizeSlack enforces key length and cardinality caps", () => {
+  const long = "a".repeat(Model.HISTORY_LIMITS.maxKeyLen + 1)
+  const v = { Zen: true }
+  v[long] = true
+  assert.deepEqual(Model.sanitizeSlack(v), { zen: true })
+
+  const big = {}
+  for (let i = 0; i <= Model.HISTORY_LIMITS.maxSlackKeys; i++) big["k" + i] = true
+  assert.deepEqual(Model.sanitizeSlack(big), {})
+})
+

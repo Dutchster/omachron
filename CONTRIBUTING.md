@@ -18,8 +18,8 @@ started.
 node --check lib/Model.js && node --check lib/State.js && node --check lib/Messages.js
 node --test tests/model.test.js tests/state.test.js tests/messages.test.js
 
-# Python (resolve_app.py)
-python3 -m py_compile scripts/resolve_app.py
+# Python (resolve_app.py, fs_guard.py)
+python3 -m py_compile scripts/resolve_app.py scripts/fs_guard.py
 python3 -m unittest discover -s tests
 
 # QML lint (best-effort, requires qt6-declarative-tools)
@@ -45,7 +45,9 @@ lib/
   slack_apps.json     Sites and programs that count as slacking off by default
 scripts/
   resolve_app.py      Terminal, Steam and browser-site resolver
-  fetch_site_icon.sh  One-shot site favicon fetch
+  fetch_site_icon.sh  One-shot site favicon fetch (network side)
+  fs_guard.py         Descriptor-based filesystem transactions (history
+                      load/save, icon listing, scratch lifecycle, publish)
 tests/                Unit tests (Node.js + Python)
 docs/assets/        README images
 ```
@@ -151,6 +153,19 @@ them and fails on drift.
 Sites are matched on any parent suffix, so `youtube.com` also covers
 `music.youtube.com`. Add the registrable domain, not a subdomain, unless
 the subdomain is genuinely a different thing.
+
+## Filesystem helper contract
+
+Every stateful disk operation runs through `scripts/fs_guard.py` — history
+load/save, the icon-cache listing, and the icon fetcher's scratch
+create/publish/discard lifecycle. `Service.qml` and
+`scripts/fetch_site_icon.sh` invoke its subcommands with fixed command
+strings, and `tests/test_fs_guard.py` pins both sides the same way the
+inline JSON copies above are pinned: it asserts the exact invocation
+fragments in `Service.qml` and `fetch_site_icon.sh`, and that the domain
+regex in `fetch_site_icon.sh` is textually identical to
+`fs_guard.DOMAIN_RE`. If you change a subcommand name, an argv shape, or
+either regex, update all sides — the drift tests fail otherwise.
 
 ## License
 

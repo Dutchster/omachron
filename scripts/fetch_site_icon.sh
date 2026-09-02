@@ -14,53 +14,62 @@
 # DNS pinned with --resolve so the checked addresses are the ones curl
 # connects to, a hard byte ceiling on every download, and the result
 # accepted only as a known bitmap type whose declared dimensions fit a
-# decode ceiling. Scratch files live in a fresh private directory (0700,
-# unpredictable name) on the destination's own filesystem, so nothing can
-# pre-position a symlink where curl writes and the final publish is one
-# atomic rename.
+# decode ceiling. All filesystem state — the cache-directory chain, this
+# run's private scratch directory, stale-scratch cleanup, and the final
+# atomic publish — is handled by fs_guard.py through held no-follow
+# directory descriptors, so no pathname is re-resolved between a check and
+# the action it guards.
 #
-# Usage: fetch_site_icon.sh <domain> <dest.png>
+# Usage: fetch_site_icon.sh <domain>
+# The icon is published as <domain>.png in the plugin's icons cache.
 # Exits non-zero when no usable image could be fetched.
 
 set -u
 
 domain="${1:-}"
-dest="${2:-}"
-[[ -n $domain && -n $dest ]] || exit 1
+[[ -n $domain ]] || exit 1
 
 # Accept only a plain dotted hostname: no ports, no userinfo, no IP
 # literals (a bare IPv4 address has no letters; IPv6 needs colons).
+# fs_guard.py enforces the same shape again at publish time; a drift test
+# pins the two regexes to each other.
 [[ $domain =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62})?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62})?)+$ ]] || exit 1
 [[ $domain == *[A-Za-z]* ]] || exit 1
 
 max_bytes=2097152 # 2 MiB ceiling per download
 max_dim=2048      # decoded-dimension ceiling per side
 site_url="https://$domain/"
-destdir=$(dirname -- "$dest")
+# The helper is invoked again after cd'ing into the scratch dir (and from
+# / in the traps), so its path must be absolute regardless of how this
+# script was launched.
+script_dir="${BASH_SOURCE[0]%/*}"
+[[ $script_dir == "${BASH_SOURCE[0]}" ]] && script_dir=.
+[[ $script_dir == /* ]] || script_dir="$PWD/$script_dir"
+guard="$script_dir/fs_guard.py"
+command -v python3 >/dev/null 2>&1 || exit 1
 
-# Predictable "$dest.tmp.$$" paths in a shared directory would let another
-# same-user process pre-position a symlink for curl to follow. Instead all
-# scratch space lives in a directory mktemp just created 0700 with an
-# unpredictable name — inside destdir, so publishing stays a same-filesystem
-# atomic rename — and umask keeps everything written there 0600. The EXIT
-# trap removes it on every path a signal lets us see; only SIGKILL can
-# leave one behind, so stale ones are swept after an hour rather than
-# accumulating. The sweep touches only directories carrying this script's
-# own creation signature (our uid, mktemp's exact 0700, aged past any
-# in-tree deadline) and is deliberately not recursive: a run only ever
-# creates "icon" and "page", so exactly those names are unlinked and the
-# directory removed only if that emptied it — contents someone else put
-# there are never deleted, the dir is just left standing.
-mkdir -p -- "$destdir" || exit 1
-find "$destdir" -maxdepth 1 -type d -name '.fetch.*' \
-  -uid "$(id -u)" -perm 700 -mmin +60 -exec sh -c \
-  'for d do rm -f -- "$d/icon" "$d/page"; rmdir -- "$d" 2>/dev/null; done' \
-  sh {} + 2>/dev/null
+# Scratch space comes from fs_guard icon-scratch: a fresh 0700 directory
+# with an unguessable 96-bit random name, created relative to a verified
+# no-follow descriptor chain and recorded in a creation journal. The same
+# call sweeps stale scratch dirs — but only names the journal lists, never
+# a directory that merely matches a name/uid/mode/age signature, and never
+# recursively. We cd into the scratch dir once and write only relative
+# paths, so the process cwd holds the inode for the run: a swapped parent
+# component cannot redirect where curl writes, and publication re-verifies
+# every link of the chain descriptor-relative before the atomic rename.
+# The HUP/INT/TERM traps convert fatal signals into a normal exit so the
+# EXIT trap actually runs when the caller's deadline delivers SIGTERM;
+# only SIGKILL can leak a scratch dir, and the journal sweep reclaims it.
 umask 077
-tmpdir=$(mktemp -d -- "$destdir/.fetch.XXXXXXXX") || exit 1
-tmp="$tmpdir/icon"
-page_tmp="$tmpdir/page"
-trap 'rm -rf -- "$tmpdir"' EXIT
+tmpdir=$(python3 "$guard" icon-scratch) || exit 1
+base=${tmpdir##*/}
+trap 'cd /; python3 "$guard" icon-discard "$base"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cd -- "$tmpdir" || exit 1
+tmp="./icon"
+page_tmp="./page"
 
 ipv4_private() {
   local a b c d
@@ -177,10 +186,14 @@ fetch_site_icon() {
 }
 
 if fetch_site_icon; then
-  # -T so a directory planted at $dest fails the rename instead of the
-  # icon being moved inside it; rename replaces a symlinked $dest itself
-  # rather than following it. The EXIT trap sweeps the now-empty tmpdir.
-  mv -fT -- "$tmp" "$dest" || exit 1
+  # icon-publish re-opens the scratch directory and the icon through the
+  # verified descriptor chain (no-follow at every step, size and type
+  # checked on the held fd) and renames the icon into place relative to
+  # those descriptors — an atomic same-filesystem publish that nothing
+  # path-based can redirect. It also removes the scratch dir and its
+  # journal entry; the EXIT trap's icon-discard is then a no-op.
+  cd /
+  python3 "$guard" icon-publish "$base" "$domain" || exit 1
   exit 0
 fi
 exit 1
