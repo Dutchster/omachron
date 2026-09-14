@@ -117,14 +117,25 @@ Item {
   // service), and a lock surface is not a toplevel: the compositor goes on
   // reporting the window that was focused when the screen locked, so the
   // heartbeat would accrue a whole night onto it. shouldTrack() cannot catch
-  // this because the appId never changes, so the lock state is read from the
-  // shell instead. The binding re-evaluates when the shell's service table is
-  // replaced, and degrades to "never locked" on a shell that predates
-  // serviceFor().
+  // this because the appId never changes, so the lock state has to come from
+  // somewhere else.
+  //
+  // Not from the shell: it scopes serviceFor() to a plugin's own id, so for
+  // a third-party plugin shell.serviceFor("omarchy.lock") is null and this
+  // binding reads "never locked". It is kept for a shell that does grant the
+  // lookup (it costs nothing and reacts instantly), but the signal that
+  // works everywhere is the compositor's own. Hyprland reports no lock state
+  // directly, but an active ext-session-lock is one of the reasons a monitor
+  // cannot go solitary, and it shows up as LOCK in `hyprctl -j monitors`
+  // solitaryBlockedBy -- the same probe omarchy-hyprland-session-locked
+  // uses, so it also covers a lock whose client died (the session stays
+  // locked behind Hyprland's failsafe). lockProbeTimer below polls it every
+  // 5s; a lock therefore costs at most that much over-attribution.
   readonly property var lockService: shell && typeof shell.serviceFor === "function"
     ? shell.serviceFor("omarchy.lock")
     : null
-  readonly property bool sessionLocked: !!(lockService && lockService.locked)
+  property bool compositorLocked: false
+  readonly property bool sessionLocked: !!(lockService && lockService.locked) || compositorLocked
 
   onSessionLockedChanged: {
     if (!root.ready) return
@@ -148,6 +159,36 @@ Item {
       // baseline before reopening a bucket for whatever now holds focus.
       root.lastTick = now
       root.switchActive()
+    }
+  }
+
+  Timer {
+    id: lockProbeTimer
+    interval: 5000
+    repeat: true
+    triggeredOnStart: true
+    running: root.ready
+    onTriggered: {
+      if (!lockProbeProc.running) lockProbeProc.running = true
+    }
+  }
+
+  // head bounds the collector at the producer: a monitor entry is a couple
+  // of KB, so 64KB covers any real setup and anything past it is garbage by
+  // definition. A truncated reply does not parse and so never flips the
+  // state. The timeout wrapper keeps a wedged hyprctl from parking the probe
+  // in "running" forever, which would freeze lock detection: it signals the
+  // process group, so the pipeline dies with it and the next tick retries.
+  Process {
+    id: lockProbeProc
+    command: ["timeout", "--kill-after=1", "4", "sh", "-c",
+      "hyprctl -j monitors 2>/dev/null | head -c 65536; exit 0"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var locked = State.sessionLockFromMonitors(text)
+        if (locked !== null) root.compositorLocked = locked
+      }
     }
   }
 
@@ -681,11 +722,15 @@ Item {
 
   // Safety net: catches appId-only changes and any missed activeToplevel
   // events. Cheap enough to run every 2s; real switches are event-driven.
+  // Paused while locked: rawApp is cleared at lock time and the compositor
+  // still reports the old window, so every tick would otherwise be a
+  // switchActive() that does nothing but rewrite the history file. Unlock
+  // calls switchActive() itself, so nothing is missed.
   Timer {
     id: reconcileTimer
     interval: 2000
     repeat: true
-    running: root.ready
+    running: root.ready && !root.sessionLocked
     onTriggered: {
       var tl = ToplevelManager.activeToplevel
       var app = tl && tl.appId ? tl.appId : ""

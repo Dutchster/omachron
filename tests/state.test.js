@@ -538,3 +538,44 @@ test("suspend gap during close prevents stale time from landing in any day", () 
   // No stale data leaked into days
   assert.equal(Object.keys(closed.days).length, 0)
 })
+
+// ---- sessionLockFromMonitors ---------------------------------------------
+
+function monitorsJson(blockerLists) {
+  return JSON.stringify(blockerLists.map((b, i) => ({
+    id: i, name: "DP-" + (i + 1), solitaryBlockedBy: b
+  })))
+}
+
+test("sessionLockFromMonitors: LOCK on any monitor means locked", () => {
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["LOCK", "WINDOWED"]])), true)
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["WORKSPACE"], ["LOCK"]])), true)
+})
+
+test("sessionLockFromMonitors: a readable monitor without LOCK means unlocked", () => {
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["WINDOWED", "CANDIDATE"]])), false)
+  // Solitary possible (fullscreen game): no blockers at all is still an answer.
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([[]])), false)
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["WORKSPACE"], ["WINDOWED"]])), false)
+})
+
+test("sessionLockFromMonitors: every monitor still at WORKSPACE is undetermined", () => {
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["WORKSPACE"]])), null)
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["WORKSPACE"], ["WORKSPACE"]])), null)
+  assert.equal(State.sessionLockFromMonitors("[]"), null)
+})
+
+test("sessionLockFromMonitors: unreadable output is undetermined", () => {
+  assert.equal(State.sessionLockFromMonitors(""), null)
+  assert.equal(State.sessionLockFromMonitors(undefined), null)
+  assert.equal(State.sessionLockFromMonitors("not json"), null)
+  assert.equal(State.sessionLockFromMonitors('{"solitaryBlockedBy":["LOCK"]}'), null)
+  // A reply cut off by the output cap never parses, so it never flips state.
+  assert.equal(State.sessionLockFromMonitors(monitorsJson([["LOCK"]]).slice(0, -3)), null)
+})
+
+test("sessionLockFromMonitors: a Hyprland without solitaryBlockedBy reads unlocked", () => {
+  assert.equal(State.sessionLockFromMonitors('[{"id":0,"name":"DP-1"}]'), false)
+  assert.equal(State.sessionLockFromMonitors('[{"id":0,"solitaryBlockedBy":{}}]'), false)
+  assert.equal(State.sessionLockFromMonitors('[null]'), false)
+})
